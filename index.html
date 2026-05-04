@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<title>Burns Timer</title>
+<link href="https://fonts.googleapis.com/css2?family=VT323&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #000; overflow: hidden; width: 100vw; height: 100vh; }
+  canvas { display: block; }
+  #overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.82);
+    z-index: 10;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 18px;
+  }
+  #overlay.show { display: flex; }
+  #overlay h2 {
+    font-family: 'VT323', monospace;
+    font-size: 2.4rem;
+    color: #ff4400;
+    letter-spacing: 2px;
+    text-shadow: 0 0 12px #ff2200;
+  }
+  #overlay p {
+    font-family: 'VT323', monospace;
+    font-size: 1.3rem;
+    color: #ffaa44;
+  }
+  #countInput {
+    font-family: 'VT323', monospace;
+    font-size: 2.8rem;
+    background: #111;
+    color: #ff6600;
+    border: 2px solid #ff4400;
+    border-radius: 8px;
+    padding: 8px 24px;
+    text-align: center;
+    width: 200px;
+    outline: none;
+    letter-spacing: 6px;
+    caret-color: #ff6600;
+  }
+  #overlayBtn {
+    font-family: 'VT323', monospace;
+    font-size: 1.6rem;
+    background: #cc2200;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 32px;
+    cursor: pointer;
+    letter-spacing: 2px;
+  }
+  #overlayBtn:hover { background: #ff3300; }
+  #hint {
+    position: fixed;
+    bottom: 18px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-family: 'VT323', monospace;
+    font-size: 1.1rem;
+    color: rgba(255,120,0,0.38);
+    pointer-events: none;
+    letter-spacing: 1px;
+    z-index: 5;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="overlay">
+  <h2>IMPOSTA CONTO ALLA ROVESCIA</h2>
+  <p>Inserisci l'ora di fine (HH:MM)</p>
+  <input id="countInput" type="text" maxlength="5" placeholder="HH:MM" />
+  <button id="overlayBtn">INIZIA</button>
+  <p style="color:#666;font-size:1rem;">ESC per annullare</p>
+</div>
+
+<div id="hint">T = orologio/conto &nbsp;|&nbsp; C = imposta ora fine &nbsp;|&nbsp; F = schermo intero</div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H, scale;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  scale = Math.min(W, H) / 900;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── Startup message ────────────────────────────────────────────────────────
+const STARTUP_HOLD = 180;  // frames at full opacity (~3s a 60fps)
+const STARTUP_FADE = 50;   // frames di dissolvenza
+let startupFrame = 0;
+
+// ── Audio ──────────────────────────────────────────────────────────────────
+const jingle = new Audio('evil jingle.mp3');
+jingle.loop = false;
+
+// ── State ──────────────────────────────────────────────────────────────────
+let mode = 'clock'; // 'clock' | 'countdown'
+let countdownEnd = null; // Date object
+let expired = false;
+let expiredBlink = 0;
+let shakeX = 0, shakeY = 0;
+
+// ── Animation ──────────────────────────────────────────────────────────────
+let t = 0;
+let flamePhase = 0;
+
+// flame noise blobs per eye
+function flameLayers(seed) {
+  const layers = [];
+  const n = 9;
+  for (let i = 0; i < n; i++) {
+    layers.push({
+      rx: 0.28 + 0.22 * Math.sin(seed + i * 1.37),
+      ry: 0.22 + 0.18 * Math.sin(seed + i * 2.11),
+      ox: 0.1 * Math.sin(seed + i * 0.91),
+      oy: -0.05 - 0.18 * (i / n),
+      phase: seed + i * 0.73,
+      speed: 1.3 + 0.9 * Math.sin(seed + i),
+    });
+  }
+  return layers;
+}
+const leftFlame  = flameLayers(0.0);
+const rightFlame = flameLayers(3.7);
+
+// ── Image + eye calibration ────────────────────────────────────────────────
+const faceImg = new Image();
+faceImg.src = 'file:///C:/Users/anton/OneDrive/Desktop/SCUOLA%20ISTITUTO%20BOLISANI/IMMAGINI%20FREE%20COPYRIGHT/IO%20SIMPSON/evil%20me.png';
+
+// Fractions relative to source image size — tweak if flames are off-centre
+const EYE_L = { fx: 0.355, fy: 0.445, frx: 0.100, fry: 0.062 };
+const EYE_R = { fx: 0.638, fy: 0.445, frx: 0.100, fry: 0.062 };
+
+function getImgBounds() {
+  if (!faceImg.naturalWidth) return null;
+  const iw = faceImg.naturalWidth, ih = faceImg.naturalHeight;
+  const sc = Math.min(W / iw, H / ih);
+  const dw = iw * sc, dh = ih * sc;
+  return { dx: (W - dw) / 2, dy: (H - dh) / 2, dw, dh };
+}
+
+function eyeCanvas(frac, b) {
+  return {
+    cx: b.dx + frac.fx * b.dw,
+    cy: b.dy + frac.fy * b.dh,
+    ew: frac.frx * b.dw,
+    eh: frac.fry * b.dh,
+  };
+}
+
+// ── Urgency (0..1) ────────────────────────────────────────────────────────
+function urgency() {
+  if (mode !== 'countdown' || !countdownEnd || expired) return 0;
+  const rem = (countdownEnd - Date.now()) / 1000;
+  if (rem <= 0) return 1;
+  // full urgency in last 60s, rising from 0 at 10min
+  return Math.max(0, Math.min(1, 1 - rem / 600));
+}
+
+// ── Draw Flames inside an eye ─────────────────────────────────────────────
+function drawFlames(cx, cy, ew, eh, _layers, urg) {
+  ctx.save();
+
+  const now = flamePhase;
+  const fireY = cy + eh * 0.55; // fuoco parte dal fondo dell'occhio
+
+  // Clip zona alta centrata sull'occhio — le fiamme possono uscire sopra
+  ctx.beginPath();
+  ctx.ellipse(cx, cy - eh * 0.55, ew * 1.08, eh * 1.85, 0, 0, Math.PI * 2);
+  ctx.clip();
+
+  // Brace scura alla base — oscura il bianco dell'occhio per effetto "occhio in fiamme"
+  const emb = ctx.createRadialGradient(cx, fireY, 0, cx, fireY, ew * 1.05);
+  emb.addColorStop(0,    'rgba(55, 8, 0, 0.80)');
+  emb.addColorStop(0.50, 'rgba(28, 4, 0, 0.50)');
+  emb.addColorStop(1,    'rgba(0, 0, 0, 0)');
+  ctx.fillStyle = emb;
+  ctx.fillRect(cx - ew * 1.2, cy - eh * 2.6, ew * 2.4, eh * 3.9);
+
+  // Nucleo luminoso alla base (brace incandescente)
+  const core = ctx.createRadialGradient(cx, fireY, 0, cx, fireY, ew * 0.54);
+  core.addColorStop(0,   `rgba(255, 255, 160, ${0.80 + urg * 0.18})`);
+  core.addColorStop(0.28, `rgba(255, 185, 18, 0.60)`);
+  core.addColorStop(1,   'rgba(255, 55, 0, 0)');
+  ctx.fillStyle = core;
+  ctx.beginPath();
+  ctx.ellipse(cx, fireY, ew * 0.54, eh * 0.40, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Lingue di fuoco — salgono dal basso verso l'alto con bezier curve
+  const N = 11;
+  for (let i = 0; i < N; i++) {
+    const ph      = now * (0.80 + i * 0.095) + i * 0.61;
+    const xOff    = ((i / (N - 1)) - 0.5) * ew * 1.22;
+    const xFlick  = Math.sin(ph * 2.5 + i * 1.15) * ew * 0.10;
+    // Lingue più alte al centro, più basse ai lati
+    const centr   = 1 - Math.pow(Math.abs(xOff) / (ew * 0.61), 1.5);
+    const h       = eh * Math.max(0.32,
+                      (1.20 + 0.90 * Math.sin(ph + i * 0.44)) * centr * (1 + urg * 0.35));
+    const bw      = ew * (0.088 + 0.048 * Math.abs(Math.sin(ph * 1.8)));
+
+    const baseX   = cx + xOff;
+    const tipX    = baseX + xFlick;
+    const tipY    = fireY - h;
+
+    // Gradiente lineare basso→alto: giallo→arancio→rosso→trasparente
+    const grad = ctx.createLinearGradient(baseX, fireY, tipX, tipY);
+    grad.addColorStop(0,    `rgba(255, 228, 65,  ${0.90 + urg * 0.08})`);
+    grad.addColorStop(0.14, `rgba(255, 130, 8,   0.80)`);
+    grad.addColorStop(0.40, `rgba(238, 42,  0,   0.58)`);
+    grad.addColorStop(0.68, `rgba(165, 8,   0,   0.26)`);
+    grad.addColorStop(1,    'rgba(50, 0, 0, 0)');
+
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(baseX - bw, fireY);
+    ctx.bezierCurveTo(
+      baseX - bw * 0.65 + xFlick * 0.35,  fireY - h * 0.26,
+      tipX  - bw * 0.18,                   fireY - h * 0.72,
+      tipX, tipY
+    );
+    ctx.bezierCurveTo(
+      tipX  + bw * 0.18,                   fireY - h * 0.72,
+      baseX + bw * 0.65 + xFlick * 0.35,  fireY - h * 0.26,
+      baseX + bw, fireY
+    );
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Braci fluttuanti che salgono e si spengono
+  for (let e = 0; e < 7; e++) {
+    const prog  = ((now * 0.30 + e * (1 / 7)) % 1 + 1) % 1; // 0→1 ciclo
+    const ex    = cx + Math.sin(now * 0.85 + e * 1.95) * ew * 0.42;
+    const ey2   = fireY - prog * eh * 2.7;
+    const alpha = Math.sin(prog * Math.PI) * 0.78;
+    const r2    = ew * 0.027 * (1 - prog * 0.52);
+    ctx.fillStyle = `rgba(255, ${Math.round(145 * (1 - prog * 0.65))}, 0, ${alpha})`;
+    ctx.beginPath();
+    ctx.arc(ex, ey2, r2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  ctx.restore();
+}
+
+// ── Draw timer text over eye ──────────────────────────────────────────────
+function drawEyeTimer(cx, cy, ew, eh, text, urg) {
+  ctx.save();
+  const fontSize = Math.min(ew * 1.1, eh * 1.6);
+  ctx.font = `${fontSize}px 'VT323', monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  // glow
+  const r = Math.floor(255);
+  const g = Math.floor(200 * (1 - urg));
+  const b = Math.floor(50 * (1 - urg));
+  ctx.shadowColor = `rgb(${r},${Math.max(0,g - 50)},0)`;
+  ctx.shadowBlur = 18 + urg * 22;
+  ctx.fillStyle = `rgb(${r},${g},${b})`;
+  ctx.fillText(text, cx, cy);
+  ctx.restore();
+}
+
+// ── Time formatting ───────────────────────────────────────────────────────
+function clockText() {
+  const now = new Date();
+  const hh = String(now.getHours()).padStart(2, '0');
+  const mm = String(now.getMinutes()).padStart(2, '0');
+  const ss = String(now.getSeconds()).padStart(2, '0');
+  return { left: hh + ':' + mm, right: mm + ':' + ss };
+}
+
+function countdownText() {
+  if (!countdownEnd) return { left: '--:--', right: '--:--' };
+  const rem = Math.max(0, countdownEnd - Date.now());
+  const totalSec = Math.ceil(rem / 1000);
+  const mm = String(Math.floor(totalSec / 60)).padStart(2, '0');
+  const ss = String(totalSec % 60).padStart(2, '0');
+  const text = mm + ':' + ss;
+  return { left: text, right: text };
+}
+
+// ── Main draw loop ────────────────────────────────────────────────────────
+function draw() {
+  t++;
+  flamePhase += 0.045;
+
+  const urg = urgency();
+
+  // Check expiry
+  if (mode === 'countdown' && countdownEnd && Date.now() >= countdownEnd && !expired) {
+    expired = true;
+    jingle.currentTime = 0;
+    jingle.play().catch(() => {});
+  }
+
+  // Shake on expired
+  if (expired) {
+    const mag = 6 + 4 * Math.sin(t * 0.3);
+    shakeX = (Math.random() - 0.5) * mag * 2;
+    shakeY = (Math.random() - 0.5) * mag * 2;
+    expiredBlink++;
+  } else {
+    shakeX *= 0.8;
+    shakeY *= 0.8;
+    // Urgency micro-shake
+    if (urg > 0.7) {
+      const micro = (urg - 0.7) * 8;
+      shakeX += (Math.random() - 0.5) * micro;
+      shakeY += (Math.random() - 0.5) * micro;
+    }
+  }
+
+  // Background
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, W, H);
+
+  // Vignette
+  const vig = ctx.createRadialGradient(W/2, H/2, Math.min(W,H)*0.3, W/2, H/2, Math.min(W,H)*0.75);
+  vig.addColorStop(0, 'rgba(0,0,0,0)');
+  vig.addColorStop(1, `rgba(0,0,0,${0.65 + urg * 0.2})`);
+  ctx.fillStyle = vig;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(shakeX, shakeY);
+
+  const bounds = getImgBounds();
+  if (bounds) {
+    // Immagine a schermo intero (mantiene proporzioni, centrata)
+    ctx.drawImage(faceImg, bounds.dx, bounds.dy, bounds.dw, bounds.dh);
+
+    // Alone rosso urgenza sopra l'immagine
+    if (urg > 0) {
+      const cx2 = bounds.dx + bounds.dw / 2, cy2 = bounds.dy + bounds.dh / 2;
+      const grd = ctx.createRadialGradient(cx2, cy2, bounds.dw * 0.15, cx2, cy2, bounds.dw * 0.72);
+      grd.addColorStop(0, 'rgba(180,0,0,0)');
+      grd.addColorStop(1, `rgba(180,0,0,${urg * 0.45})`);
+      ctx.fillStyle = grd;
+      ctx.fillRect(bounds.dx, bounds.dy, bounds.dw, bounds.dh);
+    }
+
+    // Posizioni occhi in coordinate canvas
+    const le = eyeCanvas(EYE_L, bounds);
+    const re = eyeCanvas(EYE_R, bounds);
+
+    const flameSizeMul = expired ? (1.3 + 0.2 * Math.sin(t * 0.18)) : (1 + urg * 0.18);
+    drawFlames(le.cx, le.cy, le.ew * flameSizeMul, le.eh * flameSizeMul, leftFlame, urg);
+    drawFlames(re.cx, re.cy, re.ew * flameSizeMul, re.eh * flameSizeMul, rightFlame, urg);
+
+    let lt, rt;
+    if (mode === 'clock') {
+      const txt = clockText();
+      lt = txt.left; rt = txt.right;
+    } else {
+      const txt = countdownText();
+      lt = txt.left; rt = txt.right;
+    }
+    drawEyeTimer(le.cx, le.cy, le.ew * 0.90, le.eh * 0.85, lt, urg);
+    drawEyeTimer(re.cx, re.cy, re.ew * 0.90, re.eh * 0.85, rt, urg);
+  }
+
+  ctx.restore();
+
+  // ── "TEMPO SCADUTO!" overlay ──────────────────────────────────────────
+  if (expired) {
+    const visible = Math.floor(expiredBlink / 18) % 2 === 0;
+    if (visible) {
+      const textSize = Math.min(W * 0.1, H * 0.13);
+      ctx.font = `bold ${textSize}px 'VT323', monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.shadowColor = '#ff0000';
+      ctx.shadowBlur = 40;
+      ctx.fillStyle = '#ff2200';
+      ctx.fillText('TEMPO SCADUTO!', W / 2, H * 0.1);
+      ctx.shadowBlur = 0;
+    }
+    // Red screen flash
+    const flashAlpha = 0.08 + 0.07 * Math.sin(t * 0.22);
+    ctx.fillStyle = `rgba(180,0,0,${flashAlpha})`;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  // Mode label bottom center
+  if (!expired) {
+    const labelSize = Math.min(W, H) * 0.028;
+    ctx.font = `${labelSize}px 'VT323', monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = mode === 'clock'
+      ? 'rgba(255,160,40,0.55)'
+      : `rgba(255,${Math.round(80 * (1 - urg))},0,${0.55 + urg * 0.3})`;
+    ctx.fillText(
+      mode === 'clock' ? 'OROLOGIO' : 'CONTO ALLA ROVESCIA',
+      W / 2,
+      H - Math.min(W, H) * 0.05
+    );
+  }
+
+  // ── Messaggio iniziale "Premi ESC per uscire" ────────────────────────────
+  if (startupFrame < STARTUP_HOLD + STARTUP_FADE) {
+    startupFrame++;
+    const alpha = startupFrame < STARTUP_HOLD
+      ? 1
+      : 1 - (startupFrame - STARTUP_HOLD) / STARTUP_FADE;
+    const msgSize = Math.min(W, H) * 0.032;
+    ctx.font = `${msgSize}px 'VT323', monospace`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'bottom';
+    ctx.fillStyle = `rgba(255,160,60,${alpha * 0.75})`;
+    ctx.fillText('Premi ESC per uscire', W / 2, H - Math.min(W, H) * 0.02);
+  }
+
+  requestAnimationFrame(draw);
+}
+
+// ── Countdown input overlay ────────────────────────────────────────────────
+const overlay   = document.getElementById('overlay');
+const countInput = document.getElementById('countInput');
+const overlayBtn = document.getElementById('overlayBtn');
+
+function showOverlay() {
+  overlay.classList.add('show');
+  countInput.value = '';
+  setTimeout(() => countInput.focus(), 50);
+}
+function hideOverlay() {
+  overlay.classList.remove('show');
+}
+
+function applyCountdown() {
+  const val = countInput.value.trim();
+  const match = val.match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) {
+    countInput.style.borderColor = '#ff0000';
+    setTimeout(() => countInput.style.borderColor = '#ff4400', 600);
+    return;
+  }
+  const endH = parseInt(match[1]), endM = parseInt(match[2]);
+  if (endH > 23 || endM > 59) {
+    countInput.style.borderColor = '#ff0000';
+    setTimeout(() => countInput.style.borderColor = '#ff4400', 600);
+    return;
+  }
+  const now = new Date();
+  let end = new Date(now);
+  end.setHours(endH, endM, 0, 0);
+  if (end <= now) end.setDate(end.getDate() + 1); // next day
+  countdownEnd = end;
+  expired = false;
+  expiredBlink = 0;
+  jingle.pause();
+  jingle.currentTime = 0;
+  mode = 'countdown';
+  hideOverlay();
+}
+
+overlayBtn.addEventListener('click', applyCountdown);
+countInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') applyCountdown();
+  if (e.key === 'Escape') hideOverlay();
+});
+
+// ── Keyboard controls ─────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (overlay.classList.contains('show')) return; // handled by input
+
+  switch (e.key.toLowerCase()) {
+    case 't':
+      if (mode === 'clock') {
+        mode = 'countdown';
+        if (!countdownEnd) showOverlay();
+      } else {
+        mode = 'clock';
+        expired = false;
+      }
+      break;
+    case 'c':
+      showOverlay();
+      break;
+    case 'f':
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+      break;
+    case 'escape':
+      if (expired) {
+        expired = false;
+        mode = 'clock';
+        jingle.pause();
+        jingle.currentTime = 0;
+      }
+      break;
+  }
+});
+
+// Auto-format HH:MM as user types
+countInput.addEventListener('input', () => {
+  let v = countInput.value.replace(/[^0-9]/g, '');
+  if (v.length > 4) v = v.slice(0, 4);
+  if (v.length >= 3) v = v.slice(0, 2) + ':' + v.slice(2);
+  countInput.value = v;
+});
+
+draw();
+</script>
+</body>
+</html>
